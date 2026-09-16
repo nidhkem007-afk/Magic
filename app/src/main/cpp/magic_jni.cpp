@@ -1,0 +1,933 @@
+#include <jni.h>
+
+#include <string>
+#include <cstdio>
+#include <vector>
+#include <cstring>
+#include <cstdlib>
+#include <thread>
+#include <mutex>
+#include <algorithm>
+
+#include "llama.h"
+#include "chat.h"
+
+// ============================================================
+// MAGIC PERSISTENT LLAMA ENGINE
+//
+// IMPORTANT:
+// The Qwen model is loaded ONCE and kept in memory.
+//
+// Old architecture:
+// Java -> nativeGenerate -> load model -> answer -> unload model
+//
+// New architecture:
+// Java -> nativeGenerate -> reuse loaded model -> answer
+// ============================================================
+
+namespace {
+
+    llama_model *g_model = nullptr;
+
+    bool g_backendInitialized = false;
+
+    std::mutex g_engineMutex;
+
+    std::string g_loadedModelPath;
+
+    // --------------------------------------------------------
+    // Choose a reasonable number of CPU threads automatically.
+    //
+    // We don't want an absurdly high number of threads.
+    // For a modern Android flagship, 6-8 is a reasonable range.
+    // --------------------------------------------------------
+
+    int getMagicThreadCount() {
+
+        unsigned int hardwareThreads =
+                std::thread::hardware_concurrency();
+
+        if (hardwareThreads == 0) {
+            return 6;
+        }
+
+        int threads =
+                static_cast<int>(hardwareThreads);
+
+        // Keep this within a sensible mobile range.
+        threads =
+                std::max(
+                        4,
+                        std::min(
+                                threads,
+                                8
+                        )
+                );
+
+        return threads;
+    }
+
+    // --------------------------------------------------------
+    // Load model only if it isn't already loaded.
+    // --------------------------------------------------------
+
+    bool ensureModelLoaded(
+            const std::string &modelPath
+    ) {
+
+        // Already loaded with this exact model.
+        if (g_model != nullptr
+                && g_loadedModelPath == modelPath) {
+
+            return true;
+        }
+
+        // If another model was loaded previously,
+        // release it before loading the new one.
+        if (g_model != nullptr) {
+
+            llama_model_free(
+                    g_model
+            );
+
+            g_model = nullptr;
+
+            g_loadedModelPath.clear();
+        }
+
+        // Initialize llama backend only once.
+        if (!g_backendInitialized) {
+
+            llama_backend_init();
+
+            g_backendInitialized = true;
+        }
+
+        llama_model_params modelParams =
+                llama_model_default_params();
+
+        // ----------------------------------------------------
+        // CPU for now.
+        // ----------------------------------------------------
+
+        modelParams.n_gpu_layers = 0;
+
+        // ----------------------------------------------------
+        // Load Qwen.
+        // ----------------------------------------------------
+
+        g_model =
+                llama_model_load_from_file(
+                        modelPath.c_str(),
+                        modelParams
+                );
+
+        if (g_model == nullptr) {
+
+            g_loadedModelPath.clear();
+
+            return false;
+        }
+
+        g_loadedModelPath =
+                modelPath;
+
+        return true;
+    }
+
+} // namespace
+
+
+// ============================================================
+// JNI
+// ============================================================
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_magic_assistant_MainActivity_nativeGenerate(
+        JNIEnv *env,
+        jobject /* thiz */,
+        jstring modelPath_,
+        jstring userPrompt_
+) {
+
+    // ========================================================
+    // Validate Java strings
+    // ========================================================
+
+    if (modelPath_ == nullptr
+            || userPrompt_ == nullptr) {
+
+        return env->NewStringUTF(
+                "QWEN ERROR\n\n"
+                "Model path or user prompt is null."
+        );
+    }
+
+    const char *modelPath =
+            env->GetStringUTFChars(
+                    modelPath_,
+                    nullptr
+            );
+
+    const char *userPrompt =
+            env->GetStringUTFChars(
+                    userPrompt_,
+                    nullptr
+            );
+
+    if (modelPath == nullptr
+            || userPrompt == nullptr) {
+
+        if (modelPath != nullptr) {
+
+            env->ReleaseStringUTFChars(
+                    modelPath_,
+                    modelPath
+            );
+        }
+
+        if (userPrompt != nullptr) {
+
+            env->ReleaseStringUTFChars(
+                    userPrompt_,
+                    userPrompt
+            );
+        }
+
+        return env->NewStringUTF(
+                "QWEN ERROR\n\n"
+                "Failed to read Java strings."
+        );
+    }
+
+    std::string modelPathString(
+            modelPath
+    );
+
+    std::string userPromptString(
+            userPrompt
+    );
+
+    env->ReleaseStringUTFChars(
+            modelPath_,
+            modelPath
+    );
+
+    env->ReleaseStringUTFChars(
+            userPrompt_,
+            userPrompt
+    );
+
+
+    // ========================================================
+    // ENGINE LOCK
+    //
+    // Prevent two native generations from using the same
+    // persistent model simultaneously.
+    // ========================================================
+
+    std::lock_guard<std::mutex> lock(
+            g_engineMutex
+    );
+
+
+    // ========================================================
+    // LOAD / REUSE QWEN MODEL
+    // ========================================================
+
+    if (!ensureModelLoaded(
+            modelPathString
+    )) {
+
+        return env->NewStringUTF(
+                "QWEN MODEL LOAD FAILED\n\n"
+                "Magic could not load the Qwen GGUF model."
+        );
+    }
+
+
+    // ========================================================
+    // CONTEXT PARAMETERS
+    // ========================================================
+
+    llama_context_params ctxParams =
+            llama_context_default_params();
+
+    // --------------------------------------------------------
+    // Context
+    // --------------------------------------------------------
+
+    ctxParams.n_ctx = 2048;
+
+    // --------------------------------------------------------
+    // Batch
+    // --------------------------------------------------------
+
+    ctxParams.n_batch = 512;
+
+    // --------------------------------------------------------
+    // CPU threads
+    // --------------------------------------------------------
+
+    const int magicThreads =
+            getMagicThreadCount();
+
+    ctxParams.n_threads =
+            magicThreads;
+
+    ctxParams.n_threads_batch =
+            magicThreads;
+
+
+    // ========================================================
+    // CREATE CONTEXT
+    //
+    // The MODEL stays loaded.
+    //
+    // Only the lightweight inference context is recreated.
+    // This is substantially cheaper than reloading the
+    // 1.8 GB model every message.
+    // ========================================================
+
+    llama_context *ctx =
+            llama_init_from_model(
+                    g_model,
+                    ctxParams
+            );
+
+    if (ctx == nullptr) {
+
+        return env->NewStringUTF(
+                "QWEN CONTEXT CREATION FAILED\n\n"
+                "Magic loaded the model but could not "
+                "create the inference context."
+        );
+    }
+
+
+    // ========================================================
+    // CONTEXT / BATCH INFORMATION
+    // ========================================================
+
+    const uint32_t contextSize =
+            llama_n_ctx(ctx);
+
+    const uint32_t batchSize =
+            llama_n_batch(ctx);
+
+
+    // ========================================================
+    // VOCABULARY
+    // ========================================================
+
+    const llama_vocab *vocab =
+            llama_model_get_vocab(
+                    g_model
+            );
+
+    if (vocab == nullptr) {
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                "QWEN VOCABULARY ERROR\n\n"
+                "Could not access the model vocabulary."
+        );
+    }
+
+
+    // ========================================================
+    // MAGIC SYSTEM PROMPT
+    //
+    // Keep this SHORT.
+    //
+    // Every token here must be processed before Qwen can
+    // start generating the answer.
+    // ========================================================
+
+    std::string systemPrompt =
+            "You are Magic, a helpful personal Android AI "
+            "assistant and companion. "
+            "Answer naturally, clearly and conversationally. "
+            "Be concise unless the user asks for detail. "
+            "\n\n"
+            "REMINDERS: "
+            "Only when the user clearly requests a reminder, "
+            "return ONLY valid JSON in exactly this format: "
+            "{\"title\":\"task name\",\"seconds\":30}. "
+            "Seconds means the number of seconds from now. "
+            "For all other messages, answer normally and do "
+            "not return JSON.";
+
+
+    // ========================================================
+    // CHAT TEMPLATE
+    // ========================================================
+
+    const char *chatTemplate =
+            llama_model_chat_template(
+                    g_model,
+                    nullptr
+            );
+
+    if (chatTemplate == nullptr) {
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                "QWEN CHAT TEMPLATE ERROR\n\n"
+                "Could not obtain the Qwen chat template."
+        );
+    }
+
+
+    // ========================================================
+    // CHAT MESSAGES
+    // ========================================================
+
+    std::vector<llama_chat_message> messages;
+
+    llama_chat_message systemMessage;
+
+    systemMessage.role =
+            "system";
+
+    systemMessage.content =
+            systemPrompt.c_str();
+
+
+    llama_chat_message userMessage;
+
+    userMessage.role =
+            "user";
+
+    userMessage.content =
+            userPromptString.c_str();
+
+
+    messages.push_back(
+            systemMessage
+    );
+
+    messages.push_back(
+            userMessage
+    );
+
+
+    // ========================================================
+    // APPLY QWEN CHAT TEMPLATE
+    // ========================================================
+
+    int requiredPromptSize =
+            llama_chat_apply_template(
+                    chatTemplate,
+                    messages.data(),
+                    messages.size(),
+                    true,
+                    nullptr,
+                    0
+            );
+
+    if (requiredPromptSize <= 0) {
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                "QWEN CHAT TEMPLATE FAILED\n\n"
+                "Could not format the conversation."
+        );
+    }
+
+
+    // ========================================================
+    // FORMAT PROMPT
+    // ========================================================
+
+    std::vector<char> formattedBuffer(
+            static_cast<size_t>(
+                    requiredPromptSize
+            ) + 1
+    );
+
+
+    int formattedSize =
+            llama_chat_apply_template(
+                    chatTemplate,
+                    messages.data(),
+                    messages.size(),
+                    true,
+                    formattedBuffer.data(),
+                    formattedBuffer.size()
+            );
+
+
+    if (formattedSize <= 0) {
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                "QWEN PROMPT FORMATTING FAILED\n\n"
+                "The Qwen chat template could not "
+                "be applied."
+        );
+    }
+
+
+    std::string formattedPrompt(
+            formattedBuffer.data(),
+            static_cast<size_t>(
+                    formattedSize
+            )
+    );
+
+
+    // ========================================================
+    // TOKEN COUNT
+    // ========================================================
+
+    int tokenResult =
+            llama_tokenize(
+                    vocab,
+                    formattedPrompt.c_str(),
+                    formattedPrompt.size(),
+                    nullptr,
+                    0,
+                    true,
+                    true
+            );
+
+
+    int requiredTokens;
+
+    if (tokenResult < 0) {
+
+        requiredTokens =
+                -tokenResult;
+
+    } else {
+
+        requiredTokens =
+                tokenResult;
+    }
+
+
+    if (requiredTokens <= 0) {
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                "QWEN TOKENIZATION FAILED\n\n"
+                "The prompt could not be tokenized."
+        );
+    }
+
+
+    // ========================================================
+    // CONTEXT CHECK
+    // ========================================================
+
+    if (static_cast<uint32_t>(
+            requiredTokens
+        ) >= contextSize) {
+
+        std::string error =
+                "QWEN CONTEXT TOO SMALL\n\n"
+                "Prompt tokens: "
+                + std::to_string(
+                        requiredTokens
+                )
+                + "\nContext size: "
+                + std::to_string(
+                        contextSize
+                );
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                error.c_str()
+        );
+    }
+
+
+    // ========================================================
+    // BATCH CHECK
+    // ========================================================
+
+    if (static_cast<uint32_t>(
+            requiredTokens
+        ) > batchSize) {
+
+        std::string error =
+                "QWEN PROMPT TOO LARGE FOR BATCH\n\n"
+                "Prompt tokens: "
+                + std::to_string(
+                        requiredTokens
+                )
+                + "\nBatch size: "
+                + std::to_string(
+                        batchSize
+                );
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                error.c_str()
+        );
+    }
+
+
+    // ========================================================
+    // REAL TOKENIZATION
+    // ========================================================
+
+    std::vector<llama_token> tokens(
+            static_cast<size_t>(
+                    requiredTokens
+            )
+    );
+
+
+    int actualTokens =
+            llama_tokenize(
+                    vocab,
+                    formattedPrompt.c_str(),
+                    formattedPrompt.size(),
+                    tokens.data(),
+                    tokens.size(),
+                    true,
+                    true
+            );
+
+
+    if (actualTokens < 0) {
+
+        actualTokens =
+                -actualTokens;
+    }
+
+
+    if (actualTokens <= 0) {
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                "QWEN TOKENIZATION FAILED\n\n"
+                "The final tokenization step failed."
+        );
+    }
+
+
+    tokens.resize(
+            static_cast<size_t>(
+                    actualTokens
+            )
+    );
+
+
+    // ========================================================
+    // FINAL BATCH SAFETY
+    // ========================================================
+
+    if (tokens.size() > batchSize) {
+
+        std::string error =
+                "QWEN PROMPT TOO LARGE FOR BATCH\n\n"
+                "Prompt tokens: "
+                + std::to_string(
+                        tokens.size()
+                )
+                + "\nBatch size: "
+                + std::to_string(
+                        batchSize
+                );
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                error.c_str()
+        );
+    }
+
+
+    // ========================================================
+    // PROMPT DECODE
+    // ========================================================
+
+    llama_batch promptBatch =
+            llama_batch_get_one(
+                    tokens.data(),
+                    tokens.size()
+            );
+
+
+    int decodeResult =
+            llama_decode(
+                    ctx,
+                    promptBatch
+            );
+
+
+    if (decodeResult != 0) {
+
+        std::string error =
+                "QWEN PROMPT DECODE FAILED\n\n"
+                "llama_decode returned: "
+                + std::to_string(
+                        decodeResult
+                )
+                + "\n\n"
+                "Prompt tokens: "
+                + std::to_string(
+                        tokens.size()
+                )
+                + "\nContext size: "
+                + std::to_string(
+                        contextSize
+                )
+                + "\nBatch size: "
+                + std::to_string(
+                        batchSize
+                )
+                + "\nCPU threads: "
+                + std::to_string(
+                        magicThreads
+                );
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                error.c_str()
+        );
+    }
+
+
+    // ========================================================
+    // SAMPLER
+    // ========================================================
+
+    llama_sampler *sampler =
+            llama_sampler_chain_init(
+                    llama_sampler_chain_default_params()
+            );
+
+
+    if (sampler == nullptr) {
+
+        llama_free(ctx);
+
+        return env->NewStringUTF(
+                "QWEN SAMPLER CREATION FAILED\n\n"
+                "Could not create the text sampler."
+        );
+    }
+
+
+    // --------------------------------------------------------
+    // Sampling
+    // --------------------------------------------------------
+
+    llama_sampler_chain_add(
+            sampler,
+            llama_sampler_init_top_k(
+                    40
+            )
+    );
+
+
+    llama_sampler_chain_add(
+            sampler,
+            llama_sampler_init_top_p(
+                    0.95f,
+                    1
+            )
+    );
+
+
+    llama_sampler_chain_add(
+            sampler,
+            llama_sampler_init_temp(
+                    0.7f
+            )
+    );
+
+
+    llama_sampler_chain_add(
+            sampler,
+            llama_sampler_init_dist(
+                    1234
+            )
+    );
+
+
+    // ========================================================
+    // GENERATION
+    // ========================================================
+
+    std::string response;
+
+    // --------------------------------------------------------
+    // 128 tokens is enough for normal assistant answers and
+    // reduces the chance of Magic generating unnecessarily
+    // long responses.
+    // --------------------------------------------------------
+
+    const int maxGenerationTokens =
+            128;
+
+
+    for (
+            int i = 0;
+            i < maxGenerationTokens;
+            ++i
+    ) {
+
+        printf("MAGIC: BEFORE SAMPLER SAMPLE\n"); fflush(stdout);
+        llama_token newToken =
+                llama_sampler_sample(
+                        sampler,
+                        ctx,
+                        -1
+                );
+
+
+        // ----------------------------------------------------
+        // End of generation
+        // ----------------------------------------------------
+
+        if (
+                llama_vocab_is_eog(
+                        vocab,
+                        newToken
+                )
+        ) {
+
+            break;
+        }
+
+
+        // ----------------------------------------------------
+        // Convert token to text
+        // ----------------------------------------------------
+
+        char pieceBuffer[4096];
+
+
+        int pieceSize =
+                llama_token_to_piece(
+                        vocab,
+                        newToken,
+                        pieceBuffer,
+                        sizeof(pieceBuffer),
+                        0,
+                        true
+                );
+
+
+        if (pieceSize > 0) {
+
+            response.append(
+                    pieceBuffer,
+                    static_cast<size_t>(
+                            pieceSize
+                    )
+            );
+        }
+
+
+        // ----------------------------------------------------
+        // Accept token
+        // ----------------------------------------------------
+
+        llama_sampler_accept(
+                sampler,
+                newToken
+        );
+
+
+        // ----------------------------------------------------
+        // Decode next token
+        // ----------------------------------------------------
+
+        llama_batch nextBatch =
+                llama_batch_get_one(
+                        &newToken,
+                        1
+                );
+
+
+        int nextDecode =
+                llama_decode(
+                        ctx,
+                        nextBatch
+                );
+
+
+        if (nextDecode != 0) {
+
+            std::string error =
+                    "QWEN GENERATION DECODE FAILED\n\n"
+                    "llama_decode returned: "
+                    + std::to_string(
+                            nextDecode
+                    )
+                    + "\n\n"
+                    "Generated tokens: "
+                    + std::to_string(
+                            i + 1
+                    );
+
+            llama_sampler_free(
+                    sampler
+            );
+
+            llama_free(
+                    ctx
+            );
+
+            return env->NewStringUTF(
+                    error.c_str()
+            );
+        }
+    }
+
+
+    // ========================================================
+    // CLEANUP CONTEXT ONLY
+    //
+    // IMPORTANT:
+    // We DO NOT free g_model.
+    //
+    // Qwen remains in RAM for the next message.
+    // ========================================================
+
+    llama_sampler_free(
+            sampler
+    );
+
+    llama_free(
+            ctx
+    );
+
+
+    // ========================================================
+    // EMPTY RESPONSE
+    // ========================================================
+
+    if (response.empty()) {
+
+        return env->NewStringUTF(
+                "QWEN EMPTY RESPONSE\n\n"
+                "The model generated no text."
+        );
+    }
+
+
+    // ========================================================
+    // RETURN RESPONSE
+    // ========================================================
+
+    return env->NewStringUTF(
+            response.c_str()
+    );
+}

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer glow ring -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#8A35FF"
+        android:strokeWidth="2"
+        android:pathData="M54,8 A46,46 0,1 0,54,100 A46,46 0,1 0,54,8" />
+
+    <!-- Orbital ring -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#C04CFF"
+        android:strokeWidth="2"
+        android:pathData="M14,54 C28,38 80,38 94,54 C80,70 28,70 14,54" />
+
+    <!-- Magic M -->
+    <path
+        android:fillColor="#B45CFF"
+        android:pathData="M30,76 L30,39 L42,27 L54,43 L66,27 L78,39 L78,76 L66,65 L66,46 L54,59 L42,46 L42,65 Z" />
+
+    <!-- Central star -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,13 L58,24 L69,28 L58,32 L54,43 L50,32 L39,28 L50,24 Z" />
+
+</vector>

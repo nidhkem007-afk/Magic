@@ -1,0 +1,21 @@
+{
+  "allFiles": [
+    {
+      "file": "/storage/emulated/0/CodeOnTheGoProjects/Magic/app/src/main/java/com/magic/assistant/MainActivity.java",
+      "selection": {
+        "end": {
+          "column": 1,
+          "index": 1066,
+          "line": 30
+        },
+        "start": {
+          "column": 1,
+          "index": 1066,
+          "line": 30
+        }
+      }
+    }
+  ],
+  "projectPath": "/storage/emulated/0/CodeOnTheGoProjects/Magic",
+  "selectedFile": "/storage/emulated/0/CodeOnTheGoProjects/Magic/app/src/main/java/com/magic/assistant/MainActivity.java"
+}
